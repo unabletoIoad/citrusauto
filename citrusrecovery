@@ -1,6 +1,5 @@
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -24,121 +23,14 @@ local function getUniverseId()
     return nil
 end
 
-local function getLeaderstatValue(name)
-    local player = Players.LocalPlayer
-    if not player then
-        return nil
-    end
-
-    local leaderstats = player:FindFirstChild("leaderstats")
-    if not leaderstats then
-        return nil
-    end
-
-    local stat = leaderstats:FindFirstChild(name)
-    if not stat then
-        return nil
-    end
-
-    return stat.Value
-end
-
-local function cleanValue(v)
-    local t = typeof(v)
-    if t == "number" or t == "string" or t == "boolean" then
-        return v
-    end
-    return tostring(v)
-end
-
-local GAME_BUILDERS = {}
-
-GAME_BUILDERS[3317771874] = function()
-    local data = {}
-
-    pcall(function()
-        data.diamonds = getLeaderstatValue("💎 Diamonds") or 0
-        data.rank = getLeaderstatValue("⭐ Rank") or 0
-    end)
-
-    pcall(function()
-        local save = require(ReplicatedStorage.Library.Client.Save).Get()
-        data.eggs = (save and save.EggsHatched) or 0
-    end)
-
-    pcall(function()
-        local save = require(ReplicatedStorage.Library.Client.Save).Get()
-        local pets = (save and save.Inventory and save.Inventory.Pet) or {}
-        local dir = require(ReplicatedStorage.Library.Directory.Pets)
-
-        local huge = 0
-        local titanic = 0
-
-        for _, p in pairs(pets) do
-            local d = dir[p.id]
-            if d then
-                local amount = p._am or 1
-                local idLower = tostring(p.id):lower()
-                local isTitanic = d.titanic or d.titanicLevel or string.find(idLower, "titanic")
-                local isHuge = d.huge or d.hugeLevel
-
-                if isTitanic then
-                    titanic = titanic + amount
-                elseif isHuge then
-                    huge = huge + amount
-                end
-            end
-        end
-
-        data.huge = huge
-        data.titanic = titanic
-    end)
-
-    local cleaned = {}
-    for k, v in pairs(data) do
-        cleaned[tostring(k)] = cleanValue(v)
-    end
-
-    return cleaned
-end
-
-local function getGroupedGameStats(universeId)
-    local builder = GAME_BUILDERS[universeId]
-    if not builder then
-        return nil
-    end
-
-    local ok, stats = pcall(builder)
-    if not ok or type(stats) ~= "table" then
-        return nil
-    end
-
-    return {
-        [tostring(universeId)] = stats
-    }
-end
-
 local function makePayload()
     local universeId = getUniverseId()
-    local supportedUniverseId = nil
-
-    if universeId and GAME_BUILDERS[universeId] then
-        supportedUniverseId = universeId
-    end
 
     local payload = {
-        Username = Players.LocalPlayer.Name,
-        game_id = supportedUniverseId,
+        Username = Players.LocalPlayer and Players.LocalPlayer.Name or "",
         universe_id = universeId,
         current_place_id = game.PlaceId
     }
-
-    if supportedUniverseId then
-        local grouped = getGroupedGameStats(supportedUniverseId)
-        if grouped then
-            payload.game_stats = grouped
-        end
-    end
 
     return HttpService:JSONEncode(payload)
 end
