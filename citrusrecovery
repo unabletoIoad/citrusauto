@@ -1,5 +1,7 @@
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -8,6 +10,8 @@ end
 local URL = "ws://127.0.0.1:9090/IsOnlineCitrus"
 
 local cachedUniverseId = nil
+local activeWs = nil
+local kickSent = false
 
 local function getUniverseId()
     if cachedUniverseId then
@@ -35,23 +39,161 @@ local function makePayload()
     return HttpService:JSONEncode(payload)
 end
 
+-- Kick & Ban Detection Fetcher
+local function inspectErrorText(text)
+    if type(text) ~= "string" or text == "" then return false, 0, "" end
+    local lower = text:lower()
+    local codeMatch = text:match("%(Error Code:%s*(%d+)%)") or text:match("Error Code:%s*(%d+)") or text:match("%[Error Code%s*(%d+)%]")
+    local numCode = tonumber(codeMatch) or 0
+
+    -- Only check the error code (267), not keywords
+    if numCode == 267 then
+        return true, 267, text
+    end
+    return false, 0, ""
+end
+
+local function sendKickNotification(code, reason)
+    if kickSent then return end
+    kickSent = true
+    code = tonumber(code) or 267
+    reason = tostring(reason or "No kick reason provided")
+
+    local kickPayload = HttpService:JSONEncode({
+        Type = "KickDetected",
+        Username = Players.LocalPlayer and Players.LocalPlayer.Name or "",
+        ErrorCode = code,
+        Reason = reason,
+        universe_id = getUniverseId(),
+        current_place_id = game.PlaceId
+    })
+
+    if activeWs then
+        pcall(function()
+            activeWs:Send(kickPayload)
+        end)
+    end
+
+    task.spawn(function()
+        for i = 1, 3 do
+            task.wait(0.2)
+            if activeWs then
+                pcall(function() activeWs:Send(kickPayload) end)
+            end
+        end
+    end)
+end
+
+-- Layer 1: Listen to GuiService ErrorMessageChanged
+pcall(function()
+    GuiService.ErrorMessageChanged:Connect(function(msg)
+        local isKick, code, reason = inspectErrorText(msg)
+        if isKick then
+            sendKickNotification(code, reason)
+        end
+    end)
+end)
+
+-- Layer 2: CoreGui RobloxPromptGui promptOverlay inspector
+local function scanPromptOverlay()
+    pcall(function()
+        local robloxPrompt = CoreGui:FindFirstChild("RobloxPromptGui")
+        if not robloxPrompt then return end
+        local overlay = robloxPrompt:FindFirstChild("promptOverlay")
+        if not overlay then return end
+        for _, child in ipairs(overlay:GetChildren()) do
+            for _, desc in ipairs(child:GetDescendants()) do
+                if desc:IsA("TextLabel") and desc.Text and #desc.Text > 0 then
+                    local isKick, code, reason = inspectErrorText(desc.Text)
+                    if isKick then
+                        sendKickNotification(code, reason)
+                        return
+                    end
+                end
+            end
+        end
+    end)
+end
+
+pcall(function()
+    local robloxPrompt = CoreGui:WaitForChild("RobloxPromptGui", 10)
+    if robloxPrompt then
+        local overlay = robloxPrompt:WaitForChild("promptOverlay", 10)
+        if overlay then
+            overlay.ChildAdded:Connect(function(child)
+                task.wait(0.1)
+                scanPromptOverlay()
+            end)
+        end
+    end
+end)
+
+-- Layer 3: hookmetamethod on LocalPlayer:Kick if available
+if typeof(hookmetamethod) == "function" then
+    pcall(function()
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if (method == "Kick" or method == "kick") and self == Players.LocalPlayer then
+                local args = {...}
+                local reason = tostring(args[1] or "Kicked by client script")
+                task.spawn(function()
+                    sendKickNotification(267, reason)
+                end)
+            end
+            return oldNamecall(self, ...)
+        end)
+    end)
+end
+
+-- Layer 4: Watchdog loop polling error status
+task.spawn(function()
+    while not kickSent do
+        task.wait(1)
+        pcall(function()
+            local curErr = GuiService:GetErrorMessage()
+            local isKick, code, reason = inspectErrorText(curErr)
+            if isKick then
+                sendKickNotification(code, reason)
+            else
+                scanPromptOverlay()
+            end
+        end)
+    end
+end)
+
+-- Main WebSocket Connection Loop
 task.spawn(function()
     repeat task.wait() until Players.LocalPlayer
 
     while true do
-        local ok, ws = pcall(WebSocket.connect, URL)
+        local wsConnect = WebSocket and WebSocket.connect or (syn and syn.websocket and syn.websocket.connect)
+        local ok, ws = pcall(wsConnect, URL)
 
         if ok and ws then
+            activeWs = ws
             local alive = true
 
             pcall(function()
-                ws:Send(makePayload())
+                if kickSent then
+                    local kickPayload = HttpService:JSONEncode({
+                        Type = "KickDetected",
+                        Username = Players.LocalPlayer and Players.LocalPlayer.Name or "",
+                        ErrorCode = 267,
+                        Reason = "Kick / Game Ban Detected",
+                        universe_id = getUniverseId(),
+                        current_place_id = game.PlaceId
+                    })
+                    ws:Send(kickPayload)
+                else
+                    ws:Send(makePayload())
+                end
             end)
 
             if ws.OnMessage then
                 ws.OnMessage:Connect(function(msg)
                     if not alive then return end
-                    
+
                     pcall(function()
                         local data = HttpService:JSONDecode(msg)
                         if data then
@@ -68,7 +210,9 @@ task.spawn(function()
                     end)
 
                     pcall(function()
-                        ws:Send(makePayload())
+                        if not kickSent then
+                            ws:Send(makePayload())
+                        end
                     end)
                 end)
             end
@@ -76,13 +220,16 @@ task.spawn(function()
             if ws.OnClose then
                 ws.OnClose:Connect(function()
                     alive = false
+                    if activeWs == ws then activeWs = nil end
                 end)
             end
 
             while alive do
                 task.wait(2)
                 pcall(function()
-                    ws:Send(makePayload())
+                    if not kickSent then
+                        ws:Send(makePayload())
+                    end
                 end)
             end
         end
